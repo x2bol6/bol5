@@ -723,6 +723,86 @@ def infer_status_from_text(value: str, hint: str) -> str:
     return hint or "unknown"
 
 
+def _display_status_label(status: str) -> str:
+    status = (status or "").lower().strip()
+    if status == "live":
+        return "Live"
+    if status == "finished":
+        return "Finished"
+    if status in {"upcoming", "scheduled"}:
+        return "Upcoming"
+    return status.title() if status else ""
+
+
+def _format_clean_match_row_text(status: str, team1: str, team2: str, score1: Any = None, score2: Any = None) -> str:
+    """Build a verifier-safe row summary without BO3 prediction/odds tails.
+
+    BO3 cards/pages can place prediction snippets such as "2 2 - 3" near the
+    match card text.  Those numbers are odds/prediction content, not the live
+    series score.  Keep raw debug text separately, but expose raw_text as a clean
+    structured summary so callers do not accidentally parse prediction tails.
+    """
+    team1 = collapse_ws(str(team1 or ""))
+    team2 = collapse_ws(str(team2 or ""))
+    label = _display_status_label(status)
+    parts: List[str] = []
+    if label:
+        parts.append(label)
+    if team1:
+        parts.append(team1)
+    if score1 is not None and score2 is not None:
+        parts.append("%s - %s" % (score1, score2))
+    elif team1 and team2:
+        parts.append("vs")
+    if team2:
+        parts.append(team2)
+    return collapse_ws(" ".join(parts))
+
+
+def _sanitize_source_row_for_payload(source_row: Optional[Dict[str, Any]], match: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a copy of source_row with stale/prediction raw_text normalized.
+
+    The list row is only a candidate pointer for /details.  Once the match detail
+    parser has fresher structured score/status, mirror that structure into
+    source_row too.  The original BO3 card text is preserved under
+    raw_text_original for debugging.
+    """
+    if source_row is None:
+        return None
+    row = dict(source_row)
+    original_raw = collapse_ws(str(row.get("raw_text_original") or row.get("raw_text") or ""))
+
+    status = (match.get("status") or row.get("status") or "").lower().strip()
+    team1 = match.get("team1") or row.get("team1") or ""
+    team2 = match.get("team2") or row.get("team2") or ""
+    score1 = match.get("score1") if match.get("score1") is not None else row.get("score1")
+    score2 = match.get("score2") if match.get("score2") is not None else row.get("score2")
+    winner = match.get("winner") or row.get("winner") or ""
+
+    # Keep source_row consistent with the verifier-safe match summary when the
+    # detail/API path found a real score.  This avoids stale list-card values
+    # like live 0-0 lingering beside match.score1/match.score2 = 0-1.
+    if match.get("score1") is not None and match.get("score2") is not None:
+        row["status"] = status or row.get("status", "")
+        row["team1"] = team1
+        row["team2"] = team2
+        row["score1"] = match.get("score1")
+        row["score2"] = match.get("score2")
+        row["winner"] = winner
+        row["raw_text"] = _format_clean_match_row_text(status, team1, team2, match.get("score1"), match.get("score2"))
+        row["raw_text_source"] = "rebuilt_from_match_detail"
+    else:
+        cleaned = _format_clean_match_row_text(status, team1, team2, score1, score2)
+        if cleaned:
+            row["raw_text"] = cleaned
+            row["raw_text_source"] = "rebuilt_from_candidate_row"
+
+    if original_raw and original_raw != row.get("raw_text"):
+        row["raw_text_original"] = original_raw
+        row["raw_text_note"] = "original BO3 card text may include prediction/odds tail; raw_text is normalized"
+    return row
+
+
 def parse_match_anchor(text: str, href: str, status_hint: str) -> Optional[Dict[str, Any]]:
     raw = collapse_ws(text)
     href = abs_bo3_url(href)
@@ -794,8 +874,9 @@ def parse_match_anchor(text: str, href: str, status_hint: str) -> Optional[Dict[
         score2 = None
         winner = ""
 
-    return {
-        "raw_text": raw,
+    clean_raw = _format_clean_match_row_text(status, team1, team2, score1, score2) or raw
+    row = {
+        "raw_text": clean_raw,
         "status": status,
         "time": started_at,
         "bo": bo,
@@ -806,6 +887,10 @@ def parse_match_anchor(text: str, href: str, status_hint: str) -> Optional[Dict[
         "winner": winner,
         "url": href,
     }
+    if raw and raw != clean_raw:
+        row["raw_text_original"] = raw
+        row["raw_text_note"] = "original BO3 card text may include prediction/odds tail; raw_text is normalized"
+    return row
 
 
 def parse_match_list_from_anchors(raw_html: str, status_hint: str) -> List[Dict[str, Any]]:
@@ -896,7 +981,8 @@ def parse_match_list_from_visible_lines(raw_html: str, status_hint: str) -> List
         winner = team1 if s1 > s2 else team2 if s2 > s1 else "draw"
         segments.append(
             {
-                "raw_text": raw,
+                "raw_text": _format_clean_match_row_text(status_word or infer_status_from_text(raw, status_hint), team1, team2, s1, s2) or raw,
+                "raw_text_original": raw,
                 "status": status_word or infer_status_from_text(raw, status_hint),
                 "time": m.group("time"),
                 "bo": "",
@@ -2177,6 +2263,83 @@ def item_matches_team_filters(item: Dict[str, Any], team1: str = "", team2: str 
     return True
 
 
+def _payload_game_from_match(match: Dict[str, Any], source_row: Optional[Dict[str, Any]] = None) -> str:
+    """Best-effort game key from a BO3 detail/list payload."""
+    for obj in (match, source_row or {}):
+        if not isinstance(obj, dict):
+            continue
+        for key in ("game", "game_slug", "gameSlug"):
+            val = str(obj.get(key) or "").strip().lower()
+            if val:
+                return val
+        url = str(obj.get("url") or "")
+        path = urlparse(url).path.lower() if url else ""
+        for game_key in ("lol", "cs2", "valorant", "dota2", "r6s", "mlbb"):
+            if ("/" + game_key + "/") in path:
+                return game_key
+    return ""
+
+
+def _as_int_or_none(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _looks_like_lol_kill_score(score1: Optional[int], score2: Optional[int]) -> bool:
+    """LoL map rows from BO3 detail HTML often expose champion kills, not game score."""
+    if score1 is None or score2 is None:
+        return False
+    return max(int(score1), int(score2)) > 3
+
+
+def _safe_lol_map_result_from_series(
+    match: Dict[str, Any],
+    map_index: int,
+    map_count: int,
+    team1: str,
+    team2: str,
+) -> Tuple[Optional[int], Optional[int], str]:
+    """Return a verifier-safe 0/1 LoL game result when series state proves it.
+
+    BO3 LoL detail pages can expose per-map *kill* scores (for example 10-30).
+    Those are useful debug numbers, but they must not decide a Polymarket
+    Game 1/2/3 winner.  We only infer a per-map result from the series score
+    in cases where the map order is unambiguous:
+      • exactly one map has completed; or
+      • the current/finished series is a sweep, so every played map has the
+        same winner.
+    Otherwise we return unresolved so callers fail closed instead of treating
+    kill differential as a map winner.
+    """
+    s1 = _as_int_or_none(match.get("score1"))
+    s2 = _as_int_or_none(match.get("score2"))
+    if s1 is None or s2 is None or not team1 or not team2:
+        return None, None, ""
+    total = s1 + s2
+    if total <= 0 or int(map_index) > total:
+        return None, None, ""
+
+    # Only one completed map: the series score tells us that exact map winner.
+    if total == 1 and int(map_index) == 1:
+        if s1 == 1 and s2 == 0:
+            return 1, 0, team1
+        if s1 == 0 and s2 == 1:
+            return 0, 1, team2
+
+    # Sweep: every completed map was won by the same side, so map order is safe.
+    if total == map_count and (s1 == 0 or s2 == 0):
+        if s1 > s2:
+            return 1, 0, team1
+        if s2 > s1:
+            return 0, 1, team2
+
+    return None, None, ""
+
+
 def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     match = dict(data.get("match") or {})
     maps = list(data.get("maps") or [])
@@ -2229,24 +2392,44 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
 
     # Keep map winner labels consistent with the final match team labels.  BO3
     # live/detail pages can abbreviate team names differently than list rows.
+    #
+    # Important LoL guard: BO3 detail pages often expose per-map champion kills
+    # as score1/score2 (for example 10-30).  Kills are not the map/game score,
+    # and a team can win LoL with fewer or tied kills, so never use those numbers
+    # to derive a Polymarket Game winner.  When the series score makes the map
+    # winner unambiguous, publish a 0/1 map result and keep the kills only as
+    # debug fields.  Otherwise leave the map unresolved so the caller fails closed.
     team1 = match.get("team1", "") or ""
     team2 = match.get("team2", "") or ""
+    game_key = _payload_game_from_match(match, source_row)
     cleaned_maps: List[Dict[str, Any]] = []
     for idx, mp in enumerate(maps, 1):
-        score1 = mp.get("score1")
-        score2 = mp.get("score2")
+        raw_score1 = _as_int_or_none(mp.get("score1"))
+        raw_score2 = _as_int_or_none(mp.get("score2"))
+        score1 = raw_score1
+        score2 = raw_score2
         winner = ""
-        if score1 is not None and score2 is not None and team1 and team2:
+
+        if game_key == "lol" and _looks_like_lol_kill_score(raw_score1, raw_score2):
+            safe_s1, safe_s2, safe_winner = _safe_lol_map_result_from_series(match, idx, len(maps), team1, team2)
+            score1, score2, winner = safe_s1, safe_s2, safe_winner
+        elif score1 is not None and score2 is not None and team1 and team2:
             winner = team1 if score1 > score2 else team2 if score2 > score1 else "draw"
-        cleaned_maps.append({
+
+        cleaned = {
             "game": mp.get("game") or idx,
             "map": mp.get("map", "") or "",
             "team1": team1,
             "team2": team2,
             "score1": score1,
             "score2": score2,
-            "winner": winner or mp.get("winner", "") or "",
-        })
+            "winner": winner or (mp.get("winner", "") or "" if game_key != "lol" else ""),
+        }
+        if game_key == "lol" and _looks_like_lol_kill_score(raw_score1, raw_score2):
+            cleaned["kill_score1"] = raw_score1
+            cleaned["kill_score2"] = raw_score2
+            cleaned["score_type"] = "map_result_from_series; kills kept separately" if winner else "kills_only_unresolved"
+        cleaned_maps.append(cleaned)
 
     # If detail-page map parsing conflicts with the authoritative finished
     # series score, drop map rows rather than publishing wrong game winners.
@@ -2273,7 +2456,7 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
         "maps": cleaned_maps,
     }
     if source_row is not None:
-        out["source_row"] = source_row
+        out["source_row"] = _sanitize_source_row_for_payload(source_row, match)
     return out
 
 
@@ -2589,7 +2772,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.7.0-live-json-first", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.7.1-source-row-safe", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
