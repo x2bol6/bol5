@@ -45,6 +45,26 @@ DEFAULT_TIMEOUT = float(os.getenv("BO3API_TIMEOUT", "20"))
 CACHE_TTL_SECONDS = int(os.getenv("BO3API_CACHE_TTL", "30"))
 DEBUG_FETCH_CHARS = int(os.getenv("BO3API_DEBUG_FETCH_CHARS", "1500"))
 
+# Cache policy:
+#   BO3API_CACHE_TTL > 0  -> in-process memory cache for that many seconds.
+#   BO3API_CACHE_TTL <= 0 -> fully bypass the app cache on every lookup.
+# This is important for live verifier usage where /v2/match/details must always
+# reflect the latest BO3.gg response instead of a stale Vercel warm-instance cache.
+def cache_enabled(ttl: Optional[int] = None) -> bool:
+    try:
+        effective_ttl = CACHE_TTL_SECONDS if ttl is None else int(ttl)
+    except Exception:
+        effective_ttl = 0
+    return effective_ttl > 0
+
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "CDN-Cache-Control": "no-store",
+    "Vercel-CDN-Cache-Control": "no-store",
+}
+
 # BO3.gg separates games by URL namespace. Root /matches is CS2 only.
 GAME_PREFIXES = {
     "cs2": "",
@@ -393,10 +413,14 @@ def game_from_path(path: str) -> str:
 
 def match_list_path(game: str, q_norm: str) -> Tuple[str, str, int]:
     prefix = game_prefix(game)
+    # Use the global BO3API_CACHE_TTL for all list pages.  With
+    # BO3API_CACHE_TTL=0 this endpoint now fetches current/finished lists fresh
+    # every time instead of keeping the old hardcoded 20s/60s caches.
+    ttl = CACHE_TTL_SECONDS
     if q_norm in {"current", "live", "schedule", "upcoming"}:
-        return prefix + "/matches/current", "current", 20
+        return prefix + "/matches/current", "current", ttl
     if q_norm in {"finished", "results"}:
-        return prefix + "/matches/finished", "finished", 60
+        return prefix + "/matches/finished", "finished", ttl
     raise ValueError("q must be one of current/live/schedule/upcoming/finished/results")
 
 
@@ -1180,20 +1204,26 @@ async def fetch_match_list_from_api_v1(game: str, q_norm: str, status_hint: str)
             }
             url = API_V1_BASE_URL + "/matches?" + urlencode(params)
             now = time.time()
-            cached = _cache.get(url)
-            if cached and now - cached.ts <= 60:
+            ttl = CACHE_TTL_SECONDS
+            cached = _cache.get(url) if cache_enabled(ttl) else None
+            if cached and now - cached.ts <= ttl:
                 raw = cached.value
             else:
                 try:
-                    resp = await client.get(url, headers=API_V1_HEADERS)
+                    request_headers = dict(API_V1_HEADERS)
+                    if not cache_enabled(ttl):
+                        request_headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
+
+                    resp = await client.get(url, headers=request_headers)
                     if resp.status_code == 429:
                         retry_after = resp.headers.get("Retry-After")
                         delay = float(retry_after) if retry_after and retry_after.isdigit() else 1.5
                         await asyncio.sleep(min(delay, 8.0))
-                        resp = await client.get(url, headers=API_V1_HEADERS)
+                        resp = await client.get(url, headers=request_headers)
                     resp.raise_for_status()
                     raw = resp.text or ""
-                    _cache[url] = CacheEntry(time.time(), raw)
+                    if cache_enabled(ttl):
+                        _cache[url] = CacheEntry(time.time(), raw)
                 except Exception as exc:
                     if len(errors) < 3:
                         errors.append("%s: %s" % (url, exc))
@@ -1293,7 +1323,7 @@ async def fetch_match_list_from_api(game: str, q_norm: str, status_hint: str) ->
         for params in query_sets:
             path = base + "?" + urlencode(params)
             try:
-                raw = await fetch_html(path, ttl=60)
+                raw = await fetch_html(path, ttl=CACHE_TTL_SECONDS)
                 segments = parse_match_list_from_api_json(raw, game, status_hint)
                 if not segments:
                     continue
@@ -2213,7 +2243,7 @@ async def fetch_compact_detail_for_item(item: Dict[str, Any], game: str) -> Dict
         }
         return compact_detail_payload({"match": match_summary, "maps": []}, item)
 
-    raw = await fetch_html(full_url, ttl=60)
+    raw = await fetch_html(full_url, ttl=CACHE_TTL_SECONDS)
     data = parse_match_detail(raw, full_url)
     data = merge_detail_with_list_item(data, item)
     compact = compact_detail_payload(data, item)
@@ -2423,9 +2453,14 @@ async def get_client() -> httpx.AsyncClient:
 async def fetch_html(url_or_path: str, ttl: int = CACHE_TTL_SECONDS) -> str:
     url = normalize_url(url_or_path)
     now = time.time()
-    cached = _cache.get(url)
-    if cached and now - cached.ts <= ttl:
-        return cached.value
+
+    # Important: ttl <= 0 means absolutely no in-process cache read/write.
+    # This makes BO3API_CACHE_TTL=0 safe for live result verification.
+    use_cache = cache_enabled(ttl)
+    if use_cache:
+        cached = _cache.get(url)
+        if cached and now - cached.ts <= ttl:
+            return cached.value
 
     client = await get_client()
     last_exc: Optional[Exception] = None
@@ -2434,7 +2469,11 @@ async def fetch_html(url_or_path: str, ttl: int = CACHE_TTL_SECONDS) -> str:
     for profile_name, headers in HEADER_PROFILES:
         for attempt in range(1, 3):
             try:
-                resp = await client.get(url, headers=headers)
+                request_headers = dict(headers)
+                if not use_cache:
+                    request_headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
+
+                resp = await client.get(url, headers=request_headers)
                 if resp.status_code == 429:
                     retry_after = resp.headers.get("Retry-After")
                     delay = float(retry_after) if retry_after and retry_after.isdigit() else 1.5 * attempt
@@ -2449,7 +2488,8 @@ async def fetch_html(url_or_path: str, ttl: int = CACHE_TTL_SECONDS) -> str:
                 if is_client_shell(text) and profile_name != HEADER_PROFILES[-1][0]:
                     break
 
-                _cache[url] = CacheEntry(time.time(), text)
+                if use_cache:
+                    _cache[url] = CacheEntry(time.time(), text)
                 return text
             except Exception as exc:
                 last_exc = exc
@@ -2457,7 +2497,8 @@ async def fetch_html(url_or_path: str, ttl: int = CACHE_TTL_SECONDS) -> str:
                     await asyncio.sleep(0.5 * attempt)
 
     if last_text:
-        _cache[url] = CacheEntry(time.time(), last_text)
+        if use_cache:
+            _cache[url] = CacheEntry(time.time(), last_text)
         return last_text
     raise HTTPException(status_code=502, detail="BO3.gg fetch failed: %s" % (last_exc,))
 
@@ -2478,6 +2519,14 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def add_no_cache_headers(request, call_next):
+    response = await call_next(request)
+    for key, value in NO_CACHE_HEADERS.items():
+        response.headers[key] = value
+    return response
+
+
 @app.on_event("shutdown")
 async def shutdown() -> None:
     global _client
@@ -2487,7 +2536,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.6.8", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.6.9-no-cache", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
@@ -2586,7 +2635,7 @@ async def match_details(
         if not is_match_detail_path(urlparse(full_url).path):
             raise HTTPException(status_code=400, detail="match details URL must be a BO3 match detail URL under /matches/")
 
-        raw = await fetch_html(full_url, ttl=60)
+        raw = await fetch_html(full_url, ttl=CACHE_TTL_SECONDS)
         canonical = game_from_path(urlparse(full_url).path)
         data = parse_match_detail(raw, full_url)
 
