@@ -65,6 +65,15 @@ NO_CACHE_HEADERS = {
     "Vercel-CDN-Cache-Control": "no-store",
 }
 
+# When cache is disabled, prefer BO3's browser JSON API for match lists.
+# The public HTML/SSR match-list cards can lag or contain prediction tails like
+# "Live T1 0 - 0 Gen.G Esports 2 2 - 3" while BO3's browser-rendered page
+# has already moved to the real live score.  Use the JSON API first only in
+# no-cache mode so normal cached deployments keep the cheaper HTML path.
+BO3API_PREFER_JSON_WHEN_NO_CACHE = os.getenv(
+    "BO3API_PREFER_JSON_WHEN_NO_CACHE", "true"
+).strip().lower() not in ("0", "false", "no", "off", "")
+
 # BO3.gg separates games by URL namespace. Root /matches is CS2 only.
 GAME_PREFIXES = {
     "cs2": "",
@@ -1350,6 +1359,22 @@ async def fetch_match_list_from_api(game: str, q_norm: str, status_hint: str) ->
 async def fetch_match_list_data(game: str, q_norm: str, include_unscored_finished: bool = False) -> Tuple[Dict[str, Any], str, str, str, int]:
     canonical = normalize_game(game)
     path, hint, ttl = match_list_path(canonical, q_norm)
+
+    # In no-cache mode the caller is asking for the freshest possible live
+    # state. BO3's SSR/HTML list cards can lag behind the browser-rendered
+    # score, so try the browser JSON API before the HTML parser.
+    if BO3API_PREFER_JSON_WHEN_NO_CACHE and not cache_enabled(CACHE_TTL_SECONDS) and q_norm in {
+        "current", "live", "finished", "results"
+    }:
+        try:
+            api_data, api_path = await fetch_match_list_from_api(canonical, q_norm, hint)
+            if api_data.get("segments"):
+                api_data["segments"] = [normalize_segment_url_for_game(item, canonical) for item in (api_data.get("segments") or [])]
+                api_data["count"] = len(api_data.get("segments") or [])
+                return api_data, api_path or path, "json-api", hint, ttl
+        except Exception:
+            pass
+
     raw = await fetch_html(path, ttl=ttl)
     data = parse_match_list(raw, hint, include_unscored_finished=include_unscored_finished)
     data["segments"] = [normalize_segment_url_for_game(item, canonical) for item in (data.get("segments") or [])]
@@ -1418,22 +1443,19 @@ def filter_segments_for_request(segments: List[Dict[str, Any]], q_norm: str) -> 
 
 
 def status_from_detail_lines(lines: List[str]) -> str:
-    top_lines = [collapse_ws(x).lower() for x in lines[:60]]
+    # Only inspect the match header, not the global nav.  The nav contains
+    # "Finished" links on every BO3 page and caused live matches to be labelled
+    # finished.
+    top_lines = [collapse_ws(x).lower() for x in detail_top_lines(lines, max_lines=140)[:80]]
     top = "\n".join(top_lines)
 
-    # BO3 match pages often include generic SEO copy such as "live scores" even
-    # on completed match pages.  Finished/cancelled labels and final scores must
-    # win before any live detection, otherwise /details?q=finished can be
-    # returned with match.status="live".
-    if re.search(r"\b(ended|finished|completed|complete|full time|final)\b", top):
-        return "finished"
-    if re.search(r"\bpostponed\b", top):
+    if re.search(r"\b(postponed)\b", top):
         return "postponed"
-    if re.search(r"\bcancelled|canceled\b", top):
+    if re.search(r"\b(cancelled|canceled)\b", top):
         return "cancelled"
 
     # Treat "live" as a status only when it appears as its own short label, not
-    # when it is part of generic page text like "live score" / "live scores".
+    # when it is part of generic SEO text like "live score" / "live scores".
     for line in top_lines:
         if line in {"live", "match live"}:
             return "live"
@@ -1441,6 +1463,11 @@ def status_from_detail_lines(lines: List[str]) -> str:
             return "live"
         if re.search(r"\bstatus\s*[:：-]\s*live\b", line):
             return "live"
+
+    # Finished/cancelled labels are only trusted after the live checks above and
+    # only inside the match header.
+    if re.search(r"\b(ended|finished|completed|complete|full time|final)\b", top):
+        return "finished"
     return "unknown"
 
 
@@ -1495,19 +1522,24 @@ def is_section_stop(line: str) -> bool:
 
 
 def detail_top_lines(lines: List[str], max_lines: int = 120) -> List[str]:
-    """Return only the match header block, excluding predictions/stats/noise."""
+    """Return only the actual match header block.
+
+    BO3 detail pages include global navigation near the top with words such as
+    "Finished" and "Schedule and Live".  The old parser kept those pre-title
+    lines, which let nav text mark live matches as finished.  Start at the H1
+    line containing "vs" and stop before prediction/stats sections.
+    """
     out: List[str] = []
     title_seen = False
     for line in lines[:max_lines]:
         if " vs " in line:
             title_seen = True
-        if title_seen and is_section_stop(line):
-            break
-        # Ignore global nav/header before the H1 title if present.
-        if not title_seen and line.lower() in {"cs2", "valorant", "r6s", "dota 2", "lol", "mlbb", "sign in"}:
+        if not title_seen:
             continue
+        if is_section_stop(line):
+            break
         out.append(line)
-    return out
+    return out if out else lines[:max_lines]
 
 
 def lines_between_markers(lines: List[str], start_regex: str, stop_regex: str) -> List[str]:
@@ -2019,13 +2051,34 @@ def merge_detail_with_list_item(data: Dict[str, Any], item: Dict[str, Any]) -> D
         match["bo"] = item.get("bo")
 
     # Never let a scheduled/current-card prediction tail overwrite detail data.
-    # List scores are safe only from finished/live rows.
+    # List scores are safe only from finished/live rows, and live 0-0 list cards
+    # must not overwrite a fresher detail/API score such as 0-1 / 1-0.
     if has_list_score and list_status not in {"upcoming", "scheduled"}:
-        match["score1"] = score1
-        match["score2"] = score2
-        match["winner"] = item.get("winner", "")
-        if not match.get("bo"):
-            match["bo"] = infer_bo_from_series(score1, score2, data.get("maps") or [])
+        detail_s1 = match.get("score1")
+        detail_s2 = match.get("score2")
+        detail_has_score = detail_s1 is not None and detail_s2 is not None
+        try:
+            list_total = int(score1) + int(score2)
+        except Exception:
+            list_total = 0
+        try:
+            detail_total = int(detail_s1) + int(detail_s2) if detail_has_score else -1
+        except Exception:
+            detail_total = -1
+
+        should_use_list_score = (
+            not detail_has_score
+            or list_status == "finished"
+            or detail_status in {"", "unknown"}
+            or (list_status == "live" and list_total >= detail_total and list_total > 0)
+        )
+
+        if should_use_list_score:
+            match["score1"] = score1
+            match["score2"] = score2
+            match["winner"] = item.get("winner", "")
+            if not match.get("bo"):
+                match["bo"] = infer_bo_from_series(score1, score2, data.get("maps") or [])
 
     # Mirror into the old segment object.
     for key, value in match.items():
@@ -2536,7 +2589,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.6.9-no-cache", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.7.0-live-json-first", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
