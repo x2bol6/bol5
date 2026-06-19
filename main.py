@@ -759,6 +759,56 @@ def _format_clean_match_row_text(status: str, team1: str, team2: str, score1: An
     return collapse_ws(" ".join(parts))
 
 
+
+def _int_or_none_local(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _is_invalid_cs2_series_score(score1: Any, score2: Any) -> bool:
+    """CS2 match/series score is maps won, never live round score like 4-12."""
+    s1 = _int_or_none_local(score1)
+    s2 = _int_or_none_local(score2)
+    if s1 is None or s2 is None:
+        return False
+    return max(s1, s2) > 3
+
+
+def _looks_like_cs2_live_round_score(game_key: str, status: str, score1: Any, score2: Any) -> bool:
+    if (game_key or "").lower() != "cs2":
+        return False
+    if (status or "").lower() not in {"live", "current", "ongoing", "in_progress", "in progress"}:
+        return False
+    return _is_invalid_cs2_series_score(score1, score2)
+
+
+def _is_completed_cs2_map_score(score1: Any, score2: Any) -> bool:
+    """Return True only when a CS2 map score is terminal, not merely live rounds."""
+    s1 = _int_or_none_local(score1)
+    s2 = _int_or_none_local(score2)
+    if s1 is None or s2 is None or s1 == s2:
+        return False
+    hi = max(s1, s2)
+    lo = min(s1, s2)
+    # CS2 MR12 regulation ends at 13 with the loser on <=11. Overtime ends
+    # above 13 with a 2-round lead (16-14, 19-17, ...). This prevents a live
+    # 4-12 or 12-12 from being published as a map winner.
+    return (hi == 13 and lo <= 11) or (hi > 13 and hi - lo >= 2)
+
+
+def _cs2_map_winner(score1: Any, score2: Any, team1: str, team2: str) -> str:
+    if not _is_completed_cs2_map_score(score1, score2):
+        return ""
+    s1 = _int_or_none_local(score1)
+    s2 = _int_or_none_local(score2)
+    if s1 is None or s2 is None:
+        return ""
+    return team1 if s1 > s2 else team2
+
 def _sanitize_source_row_for_payload(source_row: Optional[Dict[str, Any]], match: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return a copy of source_row with stale/prediction raw_text normalized.
 
@@ -866,10 +916,23 @@ def parse_match_anchor(text: str, href: str, status_hint: str) -> Optional[Dict[
     if score1 is not None and score2 is not None and team1 and team2:
         winner = team1 if score1 > score2 else team2 if score2 > score1 else "draw"
 
+    live_round_score1 = None
+    live_round_score2 = None
+
     # BO3's /matches/current page can include upcoming cards with prediction
     # tails like "1 3 - 2". Those numbers are not actual scores. Keep the row
     # searchable as upcoming, but never expose a fake score/winner for it.
     if status in {"upcoming", "scheduled"}:
+        score1 = None
+        score2 = None
+        winner = ""
+
+    # CS2 live list/API cards expose the current map round score, e.g. 4-12,
+    # not the match series score. Preserve it as debug, but do not let it become
+    # match.score1/score2 or match.winner.
+    if _looks_like_cs2_live_round_score(game_from_path(href_path), status, score1, score2):
+        live_round_score1 = score1
+        live_round_score2 = score2
         score1 = None
         score2 = None
         winner = ""
@@ -887,6 +950,10 @@ def parse_match_anchor(text: str, href: str, status_hint: str) -> Optional[Dict[
         "winner": winner,
         "url": href,
     }
+    if live_round_score1 is not None and live_round_score2 is not None:
+        row["current_map_round_score1"] = live_round_score1
+        row["current_map_round_score2"] = live_round_score2
+        row["score_type"] = "cs2_live_rounds_not_series"
     if raw and raw != clean_raw:
         row["raw_text_original"] = raw
         row["raw_text_note"] = "original BO3 card text may include prediction/odds tail; raw_text is normalized"
@@ -1191,6 +1258,15 @@ def _api_obj_to_segment(obj: Dict[str, Any], game: str, status_hint: str) -> Opt
 
     score1, score2 = _extract_api_score(obj)
     status = _normalize_api_status(_first_present(obj, ["status", "state", "stage", "match_status", "matchStatus", "type"]), status_hint)
+
+    live_round_score1 = None
+    live_round_score2 = None
+    if _looks_like_cs2_live_round_score(game, status, score1, score2):
+        live_round_score1 = score1
+        live_round_score2 = score2
+        score1 = None
+        score2 = None
+
     if status == "finished" and (score1 is None or score2 is None):
         # Keep it as a detail candidate. The detail page often has the score.
         winner = ""
@@ -1210,7 +1286,7 @@ def _api_obj_to_segment(obj: Dict[str, Any], game: str, status_hint: str) -> Opt
     tournament = _nested_name(_first_present(obj, ["tournament", "event", "league", "championship"]))
     raw_text = collapse_ws(" ".join(str(x) for x in [time_value or "", team1, bo, team2, score1 if score1 is not None else "", "-" if score1 is not None and score2 is not None else "", score2 if score2 is not None else "", tournament] if str(x) != ""))
 
-    return {
+    item = {
         "raw_text": raw_text,
         "status": status,
         "time": collapse_ws(str(time_value or "")),
@@ -1222,6 +1298,12 @@ def _api_obj_to_segment(obj: Dict[str, Any], game: str, status_hint: str) -> Opt
         "winner": winner,
         "url": url,
     }
+    if live_round_score1 is not None and live_round_score2 is not None:
+        item["current_map_round_score1"] = live_round_score1
+        item["current_map_round_score2"] = live_round_score2
+        item["score_type"] = "cs2_live_rounds_not_series"
+        item["raw_text"] = _format_clean_match_row_text(status, team1, team2)
+    return item
 
 
 def parse_match_list_from_api_json(raw_text: str, game: str, status_hint: str) -> List[Dict[str, Any]]:
@@ -1943,13 +2025,229 @@ def _scan_map_scores_from_text_blob(text: str, team1: str, team2: str) -> List[D
     return _dedupe_map_scores(maps)
 
 
-def parse_map_scores(lines: List[str], visible: str, raw_html: str, team1: str, team2: str) -> List[Dict[str, Any]]:
+
+def _cs2_map_name_from_slug(slug: str) -> str:
+    raw = re.sub(r"[^a-z0-9]+", " ", (slug or "").lower()).strip()
+    if not raw:
+        return ""
+    aliases = {
+        "dust2": "Dust II",
+        "dust 2": "Dust II",
+        "dust ii": "Dust II",
+        "de dust2": "Dust II",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    compact = raw.replace(" ", "")
+    for name in MAP_NAMES:
+        if norm_key(name).replace(" ", "") == compact:
+            return "Dust II" if name == "Dust 2" else name
+    return canonical_map_name(raw.title()) or raw.title()
+
+
+def _cs2_map_name_from_url(url: str) -> str:
+    path = canonical_match_path(urlparse(url or "").path).strip("/")
+    parts = path.split("/")
+    # /matches/<match-slug>/<map-slug> or /<game>/matches/<match-slug>/<map-slug>
+    if len(parts) >= 3 and parts[-2] != "matches":
+        return _cs2_map_name_from_slug(parts[-1])
+    return ""
+
+
+def _iter_cs2_map_nav_blocks(raw_html: str) -> Iterable[str]:
+    if not raw_html:
+        return []
+    starts = [m.start() for m in re.finditer(
+        r'<div[^>]+class=["\'][^"\']*c-nav-match-menu-item[^"\']*c-nav-match-menu-item--game[^"\']*["\']',
+        raw_html,
+        flags=re.I,
+    )]
+    blocks: List[str] = []
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else min(len(raw_html), start + 6000)
+        blocks.append(raw_html[start:end])
+    return blocks
+
+
+def _extract_cs2_map_nav_entries(raw_html: str, source_url: str = "") -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for idx, block in enumerate(_iter_cs2_map_nav_blocks(raw_html), 1):
+        name_m = re.search(r'<div[^>]+class=["\']map-name["\'][^>]*>(?P<name>.*?)</div>', block, flags=re.I | re.S)
+        if not name_m:
+            continue
+        map_name = map_name_from_line(strip_tags(name_m.group("name")))
+        if not map_name:
+            continue
+
+        href = ""
+        href_m = re.search(r'<a\b[^>]*href=["\'](?P<href>[^"\']+)["\']', block, flags=re.I | re.S)
+        if href_m:
+            href = urljoin(BASE_URL, html.unescape(href_m.group("href")))
+
+        score1 = None
+        score2 = None
+        score_m = re.search(
+            r'class=["\']score-1["\'][^>]*>\s*(?P<s1>\d{1,2})\s*</span>.*?'
+            r'class=["\']score-2[^"\']*["\'][^>]*>\s*(?P<s2>\d{1,2})\s*</span>',
+            block,
+            flags=re.I | re.S,
+        )
+        if score_m:
+            score1 = int(score_m.group("s1"))
+            score2 = int(score_m.group("s2"))
+
+        entries.append(
+            {
+                "game": idx,
+                "map": map_name,
+                "url": href,
+                "score1": score1,
+                "score2": score2,
+                "is_current": bool(re.search(r'c-nav-match-menu-item--current|router-link-exact-active|o-label--live-2|>\s*LIVE\s*<', block, flags=re.I)),
+                "raw_class_current": "c-nav-match-menu-item--current" in block,
+            }
+        )
+    if not entries and source_url:
+        map_name = _cs2_map_name_from_url(source_url)
+        if map_name:
+            entries.append({"game": 1, "map": map_name, "url": source_url, "score1": None, "score2": None, "is_current": True})
+    return entries
+
+
+def _extract_cs2_round_totals(raw_html: str) -> Optional[Tuple[int, int]]:
+    """Sum BO3's per-half CS2 round scoreboard blocks into a map score."""
+    totals = [0, 0]
+    found = False
+    pattern = re.compile(
+        r'<div[^>]+class=["\'][^"\']*round[^"\']*round--score[^"\']*["\'][^>]*>'
+        r'.{0,250}?class=["\'][^"\']*win[^"\']*["\'][^>]*>\s*(\d{1,2})\s*</div>'
+        r'.{0,250}?class=["\'][^"\']*win[^"\']*["\'][^>]*>\s*(\d{1,2})\s*</div>',
+        flags=re.I | re.S,
+    )
+    for m in pattern.finditer(raw_html or ""):
+        totals[0] += int(m.group(1))
+        totals[1] += int(m.group(2))
+        found = True
+    if found:
+        return totals[0], totals[1]
+    return None
+
+
+def _make_cs2_map_row(
+    game_no: int,
+    map_name: str,
+    score1: Optional[int],
+    score2: Optional[int],
+    team1: str,
+    team2: str,
+    score_source: str,
+) -> Dict[str, Any]:
+    winner = _cs2_map_winner(score1, score2, team1, team2)
+    row: Dict[str, Any] = {
+        "game": game_no,
+        "map": map_name,
+        "team1": team1,
+        "team2": team2,
+        "score1": score1,
+        "score2": score2,
+        "winner": winner,
+        "score_type": "cs2_completed_map_rounds" if winner else "cs2_live_rounds_unresolved",
+        "score_source": score_source,
+    }
+    return row
+
+
+def _scan_cs2_map_scores_from_html(raw_html: str, source_url: str, team1: str, team2: str) -> List[Dict[str, Any]]:
+    if not raw_html:
+        return []
+    entries = _extract_cs2_map_nav_entries(raw_html, source_url)
+    maps: List[Dict[str, Any]] = []
+
+    # Map selector scores are reliable as per-map round scores. They are not
+    # series scores; current/live maps must stay unresolved until terminal.
+    for entry in entries:
+        s1 = entry.get("score1")
+        s2 = entry.get("score2")
+        if s1 is None or s2 is None:
+            continue
+        maps.append(_make_cs2_map_row(int(entry.get("game") or len(maps) + 1), entry.get("map", ""), s1, s2, team1, team2, "cs2_map_nav"))
+
+    # The selected map page exposes two round--score blocks, one for each half.
+    # Sum them; e.g. 4-8 + 5-5 => 9-13, proving map 1 winner.
+    round_totals = _extract_cs2_round_totals(raw_html)
+    if round_totals:
+        active = None
+        for entry in entries:
+            if entry.get("is_current"):
+                active = entry
+                break
+        map_name = (active or {}).get("map") or _cs2_map_name_from_url(source_url) or (entries[0].get("map") if entries else "")
+        game_no = int((active or {}).get("game") or 1)
+        if map_name:
+            maps.append(_make_cs2_map_row(game_no, map_name, round_totals[0], round_totals[1], team1, team2, "cs2_round_timeline"))
+
+    return _dedupe_cs2_map_rows(maps)
+
+
+def _dedupe_cs2_map_rows(maps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    for row in maps:
+        map_name = row.get("map", "") or ""
+        key = (int(row.get("game") or 0), norm_key(map_name))
+        if key == (0, ""):
+            key = (len(best) + 1, norm_key(map_name))
+        existing = best.get(key)
+        if not existing:
+            best[key] = dict(row)
+            continue
+        existing_terminal = bool(existing.get("winner"))
+        row_terminal = bool(row.get("winner"))
+        existing_scored = existing.get("score1") is not None and existing.get("score2") is not None
+        row_scored = row.get("score1") is not None and row.get("score2") is not None
+        if (row_terminal and not existing_terminal) or (row_scored and not existing_scored) or row.get("score_source") == "cs2_round_timeline":
+            best[key] = dict(row)
+    out = sorted(best.values(), key=lambda x: int(x.get("game") or 999))
+    # Preserve BO3 map order instead of renumbering by dedupe order when possible.
+    for idx, row in enumerate(out, 1):
+        row["game"] = int(row.get("game") or idx)
+    return out
+
+
+def _merge_cs2_map_rows(primary: List[Dict[str, Any]], extra: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return _dedupe_cs2_map_rows(list(primary or []) + list(extra or []))
+
+
+def _extract_cs2_map_links(raw_html: str, source_url: str) -> List[str]:
+    base_path = canonical_match_path(urlparse(source_url or "").path).rstrip("/")
+    # Strip any selected map suffix from /matches/<slug>/<map>.
+    base_m = re.match(r"^(?P<base>/(?:(?:" + GAME_PREFIX_PATTERN + r")/)?matches/[^/]+)", base_path, flags=re.I)
+    match_base = base_m.group("base") if base_m else base_path
+    links: List[str] = []
+    seen = set()
+    for entry in _extract_cs2_map_nav_entries(raw_html, source_url):
+        href = entry.get("url") or ""
+        if not href:
+            continue
+        path = canonical_match_path(urlparse(href).path).rstrip("/")
+        if not path.startswith(match_base + "/"):
+            continue
+        if href.rstrip("/") == source_url.rstrip("/") or href in seen:
+            continue
+        seen.add(href)
+        links.append(href)
+    return links[:5]
+
+def parse_map_scores(lines: List[str], visible: str, raw_html: str, team1: str, team2: str, source_url: str = "") -> List[Dict[str, Any]]:
     """Parse actual played map/game rows only.
 
     This endpoint is meant for verification, so it should return the real match
     winner plus real per-map/game winners.  It intentionally ignores streams,
     lineups, picks/bans, odds, prediction widgets, and H2H/history sections.
     """
+    cs2_maps = _scan_cs2_map_scores_from_html(raw_html, source_url, team1, team2)
+    if cs2_maps and any(item.get("score1") is not None and item.get("score2") is not None for item in cs2_maps):
+        return cs2_maps
+
     maps = _scan_map_scores_from_lines(lines, team1, team2)
     if maps and any(item.get("score1") is not None and item.get("score2") is not None for item in maps):
         return maps
@@ -2056,13 +2354,34 @@ def parse_match_detail(raw_html: str, source_url: str) -> Dict[str, Any]:
 
     status = status_from_detail_lines(lines)
     series = parse_series_score(lines, visible, team1, team2)
+    page_game = game_from_path(urlparse(source_url).path)
+    if page_game == "cs2" and _is_invalid_cs2_series_score(series.get("score1"), series.get("score2")):
+        # A CS2 series score is maps won, so 4-12 / 9-13 etc. is a map round
+        # score leaked from BO3's live map UI, not the match score.
+        series = {"score1": None, "score2": None, "winner": ""}
     if status == "unknown" and series.get("score1") is not None and series.get("score2") is not None and series.get("winner"):
         # BO3 sometimes omits an explicit "Ended" label from prerendered
         # detail HTML even though the header contains the final series score.
         status = "finished"
     bo_from_page = parse_bo_from_lines(lines)
-    maps = parse_map_scores(lines, visible, raw_html, team1, team2)
+    if page_game == "cs2" and not bo_from_page:
+        nav_map_count = len(_extract_cs2_map_nav_entries(raw_html, source_url))
+        if nav_map_count in {1, 3, 5, 7}:
+            bo_from_page = "bo%s" % nav_map_count
+    maps = parse_map_scores(lines, visible, raw_html, team1, team2, source_url)
     maps = trim_maps_for_series(maps, series["score1"], series["score2"], bo_from_page)
+
+    # For live CS2 pages, derive the current series score from completed map
+    # round scores. Current map round totals (e.g. 4-12) stay in maps but do not
+    # count until they reach a terminal CS2 score.
+    if page_game == "cs2" and (series.get("score1") is None or series.get("score2") is None):
+        completed1 = sum(1 for mp in maps if (mp.get("winner") or "") == team1)
+        completed2 = sum(1 for mp in maps if (mp.get("winner") or "") == team2)
+        if completed1 + completed2 > 0:
+            series = make_series(team1, team2, completed1, completed2)
+            if status == "unknown":
+                status = "live"
+
     bo = bo_from_page or infer_bo_from_series(series["score1"], series["score2"], maps)
 
     match_summary = {
@@ -2110,7 +2429,12 @@ def merge_detail_with_list_item(data: Dict[str, Any], item: Dict[str, Any]) -> D
 
     score1 = item.get("score1")
     score2 = item.get("score2")
-    has_list_score = score1 is not None and score2 is not None
+    item_game = _payload_game_from_match(match, item) or game_from_path(urlparse(item.get("url", "") or match.get("url", "")).path)
+    list_score_is_cs2_live_rounds = (
+        bool(item.get("score_type") == "cs2_live_rounds_not_series")
+        or _looks_like_cs2_live_round_score(item_game, item.get("status", ""), score1, score2)
+    )
+    has_list_score = score1 is not None and score2 is not None and not list_score_is_cs2_live_rounds
 
     if item.get("team1"):
         match["team1"] = item.get("team1")
@@ -2274,6 +2598,10 @@ def _payload_game_from_match(match: Dict[str, Any], source_row: Optional[Dict[st
                 return val
         url = str(obj.get("url") or "")
         path = urlparse(url).path.lower() if url else ""
+        if path:
+            detected = game_from_path(path)
+            if detected:
+                return detected
         for game_key in ("lol", "cs2", "valorant", "dota2", "r6s", "mlbb"):
             if ("/" + game_key + "/") in path:
                 return game_key
@@ -2370,11 +2698,24 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
     if source_is_unscored_upcoming and not match_has_result_now:
         match["status"] = source_status
 
+    game_key = _payload_game_from_match(match, source_row)
+
+    # CS2 guard: match.score1/score2 means maps won. If BO3 leaked a live map
+    # round score like 4-12 into the match object, move it to debug fields and
+    # let completed map rows below derive the real series score.
+    if game_key == "cs2" and _is_invalid_cs2_series_score(match.get("score1"), match.get("score2")):
+        match["current_map_round_score1"] = match.get("score1")
+        match["current_map_round_score2"] = match.get("score2")
+        match["score_type"] = "cs2_live_rounds_not_series"
+        match["score1"] = None
+        match["score2"] = None
+        match["winner"] = ""
+
     score1 = match.get("score1")
     score2 = match.get("score2")
     if score1 is not None and score2 is not None:
         try:
-            if max(int(score1), int(score2)) >= 3:
+            if game_key != "cs2" and max(int(score1), int(score2)) >= 3:
                 match["bo"] = "bo5"
             elif not match.get("bo") and (match.get("status") or "").lower() == "finished":
                 match["bo"] = infer_bo_from_series(score1, score2, maps)
@@ -2401,7 +2742,6 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
     # debug fields.  Otherwise leave the map unresolved so the caller fails closed.
     team1 = match.get("team1", "") or ""
     team2 = match.get("team2", "") or ""
-    game_key = _payload_game_from_match(match, source_row)
     cleaned_maps: List[Dict[str, Any]] = []
     for idx, mp in enumerate(maps, 1):
         raw_score1 = _as_int_or_none(mp.get("score1"))
@@ -2413,6 +2753,8 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
         if game_key == "lol" and _looks_like_lol_kill_score(raw_score1, raw_score2):
             safe_s1, safe_s2, safe_winner = _safe_lol_map_result_from_series(match, idx, len(maps), team1, team2)
             score1, score2, winner = safe_s1, safe_s2, safe_winner
+        elif game_key == "cs2":
+            winner = _cs2_map_winner(score1, score2, team1, team2)
         elif score1 is not None and score2 is not None and team1 and team2:
             winner = team1 if score1 > score2 else team2 if score2 > score1 else "draw"
 
@@ -2429,7 +2771,24 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
             cleaned["kill_score1"] = raw_score1
             cleaned["kill_score2"] = raw_score2
             cleaned["score_type"] = "map_result_from_series; kills kept separately" if winner else "kills_only_unresolved"
+        elif game_key == "cs2":
+            cleaned["score_type"] = "cs2_completed_map_rounds" if winner else "cs2_live_rounds_unresolved"
+            if mp.get("score_source"):
+                cleaned["score_source"] = mp.get("score_source")
         cleaned_maps.append(cleaned)
+
+    if game_key == "cs2" and cleaned_maps:
+        completed1 = sum(1 for mp in cleaned_maps if (mp.get("winner") or "") == team1)
+        completed2 = sum(1 for mp in cleaned_maps if (mp.get("winner") or "") == team2)
+        if completed1 + completed2 > 0 and (
+            match.get("score1") is None
+            or match.get("score2") is None
+            or _is_invalid_cs2_series_score(match.get("score1"), match.get("score2"))
+            or (match.get("status") or "").lower() == "live"
+        ):
+            match.update(make_series(team1, team2, completed1, completed2))
+            if (match.get("status") or "").lower() in {"", "unknown"}:
+                match["status"] = "live"
 
     # If detail-page map parsing conflicts with the authoritative finished
     # series score, drop map rows rather than publishing wrong game winners.
@@ -2460,6 +2819,55 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
     return out
 
 
+
+async def _enrich_cs2_maps_from_linked_pages(data: Dict[str, Any], raw_html: str, full_url: str) -> Dict[str, Any]:
+    """Fetch selected CS2 map tabs from the same BO3 match to recover completed maps.
+
+    BO3's root live match page often shows only the current map. Earlier maps
+    are available at /matches/<slug>/<map>, and their round timeline gives the
+    terminal map score. This is still the same BO3 detail parser, not a separate
+    verifier/source.
+    """
+    match = data.get("match") or {}
+    team1 = match.get("team1", "") or ""
+    team2 = match.get("team2", "") or ""
+    if not (team1 and team2):
+        return data
+
+    maps = list(data.get("maps") or [])
+    links = _extract_cs2_map_links(raw_html, full_url)
+    if not links:
+        return data
+
+    for link in links:
+        try:
+            sub_raw = await fetch_html(link, ttl=CACHE_TTL_SECONDS)
+            sub_maps = _scan_cs2_map_scores_from_html(sub_raw, link, team1, team2)
+            if sub_maps:
+                maps = _merge_cs2_map_rows(maps, sub_maps)
+        except Exception:
+            continue
+
+    if maps:
+        data["maps"] = maps
+        segments = data.get("segments") or []
+        if segments:
+            segments[0]["maps"] = maps
+
+        # If the detail header did not have a valid CS2 series score, derive it
+        # from completed maps after the linked map pages have been parsed.
+        if match.get("score1") is None or match.get("score2") is None or _is_invalid_cs2_series_score(match.get("score1"), match.get("score2")):
+            completed1 = sum(1 for mp in maps if (mp.get("winner") or "") == team1)
+            completed2 = sum(1 for mp in maps if (mp.get("winner") or "") == team2)
+            if completed1 + completed2 > 0:
+                match.update(make_series(team1, team2, completed1, completed2))
+                if (match.get("status") or "").lower() in {"", "unknown"}:
+                    match["status"] = "live"
+                data["match"] = match
+                if segments:
+                    segments[0].update(match)
+    return data
+
 async def fetch_compact_detail_for_item(item: Dict[str, Any], game: str) -> Dict[str, Any]:
     full_url = item.get("url", "") or ""
     if not full_url:
@@ -2481,6 +2889,8 @@ async def fetch_compact_detail_for_item(item: Dict[str, Any], game: str) -> Dict
 
     raw = await fetch_html(full_url, ttl=CACHE_TTL_SECONDS)
     data = parse_match_detail(raw, full_url)
+    if normalize_game(game) == "cs2":
+        data = await _enrich_cs2_maps_from_linked_pages(data, raw, full_url)
     data = merge_detail_with_list_item(data, item)
     compact = compact_detail_payload(data, item)
     compact["render_mode"] = response_mode(raw)
@@ -2772,7 +3182,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.7.1-source-row-safe", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.7.2-cs2-map-round-safe", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
@@ -2874,6 +3284,8 @@ async def match_details(
         raw = await fetch_html(full_url, ttl=CACHE_TTL_SECONDS)
         canonical = game_from_path(urlparse(full_url).path)
         data = parse_match_detail(raw, full_url)
+        if canonical == "cs2":
+            data = await _enrich_cs2_maps_from_linked_pages(data, raw, full_url)
 
         # Detail pages are best for map results. The list page is best for live
         # series score/winner when the detail page omits a side score.
